@@ -1,0 +1,148 @@
+name: Release
+
+# ============================================================================
+# Automatic release pipeline.
+#
+#   push tag v*        -> build unsigned release APK, create a GitHub Release
+#                         and attach the APK + proguard mapping + SHA256SUMS.
+#   workflow_dispatch  -> same build, artifacts only (release dry-run), so the
+#                         pipeline can be tested without publishing anything.
+#
+# The APK is intentionally UNSIGNED (the repo carries no signing material by
+# design — see the guard job). Users sign it themselves before installing.
+# ============================================================================
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8"
+
+jobs:
+  guard:
+    name: Guard - no signing material
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if any signing material is tracked
+        run: bash .github/scripts/guard-no-signing-material.sh
+
+  build:
+    name: Build release (unsigned)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: guard
+    outputs:
+      version_label: ${{ steps.meta.outputs.version_label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK (cmdline-tools + project toolchain)
+        run: bash .github/scripts/setup-android-sdk.sh
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble release
+        run: ./gradlew :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Collect release metadata
+        id: meta
+        run: |
+          set -e
+          # Version label: prefer the pushed tag, fall back to versionName+sha
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' build.gradle | head -1 || true)
+          if [ -n "${VERSION_NAME}" ] && [ "x${VERSION_NAME}" != "x" ]; then
+            echo "project versionName: ${VERSION_NAME}"
+          else
+            VERSION_NAME=dev
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            LABEL="${GITHUB_REF_NAME}"
+          else
+            LABEL="v${VERSION_NAME}-${GITHUB_SHA::7}"
+          fi
+          echo "version_label=${LABEL}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage release assets
+        env:
+          VERSION_LABEL: ${{ steps.meta.outputs.version_label }}
+        run: |
+          set -e
+          mkdir -p release-assets
+          apk=$(find . -path '*/outputs/apk/release/*' -name '*.apk' -type f | head -1)
+          if [ -z "$apk" ]; then
+            echo "::error::no release APK produced"
+            exit 1
+          fi
+          cp "$apk" "release-assets/YouLongSecurity_${VERSION_LABEL}_release-unsigned.apk"
+          # attach the proguard mapping when present (crash de-obfuscation)
+          mapping=$(find . -path '*/outputs/mapping/release/mapping.txt' -type f | head -1 || true)
+          if [ -n "$mapping" ]; then
+            cp "$mapping" "release-assets/YouLongSecurity_${VERSION_LABEL}_mapping.txt"
+          fi
+          cd release-assets
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -la
+
+      - name: Upload release assets (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
+          body: |
+            ## 自动构建产物
+
+            - 由 tag **${{ github.ref_name }}** 触发的自动构建
+            - 构建提交：`${{ github.sha }}`
+
+            > ⚠️ 本 APK **未签名**（本仓库设计上不含任何签名材料）。
+            > 安装前请使用自己的密钥签名，例如：
+            > ```
+            > apksigner sign --ks your.jks --out app-signed.apk YouLongSecurity_${{ needs.build.outputs.version_label }}_release-unsigned.apk
+            > ```
+            > 校验文件完整性请查看 `SHA256SUMS.txt`。

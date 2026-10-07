@@ -1,0 +1,312 @@
+name: CI
+
+# ============================================================================
+# Comprehensive CI for the YouLong Security Shield project.
+#
+#   1   · Gradle wrapper integrity
+#   2   · Debug APK build
+#   3   · JVM unit tests
+#   4   · Android Lint
+#   5   · Release (unsigned) build smoke test
+#   6   · Repo guard — no signing material / pirated-verification code
+#   7   · Workflow lint (actionlint)
+#   8   · Repo hygiene (wrapper bit, ignored artifacts, no local props)
+#   9   · Shell script checks (syntax + shellcheck)
+#   10  · WebView front-end assets integrity
+#   11  · License / notice compliance
+#   12  · Secret leak scan (gitleaks over full history)
+#
+# The Android SDK toolchain is bootstrapped by .github/scripts/setup-android-sdk.sh
+# which pre-installs every component AGP 8.13.2 may resolve (see the script's
+# header comment for the mid-build auto-install bug that breaks builds when a
+# component is missing at configuration time).
+# ============================================================================
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8"
+
+jobs:
+  # 1/12 — gradle wrapper jar integrity
+  wrapper-validation:
+    name: "1 · Gradle Wrapper 校验"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+  # 2/12 — full debug build (APK)
+  build-debug:
+    name: "2 · 构建 Debug APK"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK (cmdline-tools + project toolchain)
+        run: bash .github/scripts/setup-android-sdk.sh
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+      - name: Report built APKs
+        if: always()
+        run: |
+          echo "== produced APKs =="
+          find . -path '*/outputs/apk/*' -name '*.apk' -printf '%p  %s bytes\n' 2>/dev/null || true
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: app-debug-apk
+          # NOTE: the root build.gradle redirects build dirs to build_out/<module>,
+          # so the APK is NOT under app/build/ — use a resilient glob.
+          path: '**/outputs/apk/debug/*.apk'
+          if-no-files-found: error
+
+  # 3/12 — JVM unit tests (skips trivially until tests exist; keeps the pipeline honest)
+  unit-tests:
+    name: "3 · 单元测试"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK (cmdline-tools + project toolchain)
+        run: bash .github/scripts/setup-android-sdk.sh
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: '**/reports/tests/**'
+          if-no-files-found: warn
+
+  # 4/12 — Android lint
+  android-lint:
+    name: "4 · Android Lint"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK (cmdline-tools + project toolchain)
+        run: bash .github/scripts/setup-android-sdk.sh
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Run lint
+        run: ./gradlew :app:lintDebug --stacktrace --no-daemon
+      - name: Regenerate lint baseline (fix-forward helper)
+        # When lint fails on NEW errors, refresh the baseline so it can be
+        # reviewed (in the lint-diagnostics artifact) and committed to move
+        # the ratchet forward. Do NOT commit blindly — review the diff.
+        if: failure()
+        run: |
+          ./gradlew :app:updateLintBaseline --no-daemon || true
+      - name: Upload lint diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-diagnostics
+          path: |
+            app/lint-baseline.xml
+            build_out/_app/intermediates/lint_intermediate_text_report/**
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Summarize lint findings
+        if: always()
+        run: |
+          bash .github/scripts/lint-summary.sh
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: '**/reports/lint-results*.*'
+          if-no-files-found: warn
+
+  # 5/12 — release build smoke test (minify + shrink + proguard rules)
+  build-release:
+    name: "5 · 构建 Release APK（未签名）"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK (cmdline-tools + project toolchain)
+        run: bash .github/scripts/setup-android-sdk.sh
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Assemble unsigned release
+        run: ./gradlew :app:assembleRelease --stacktrace --no-daemon
+      - name: Report built APKs
+        if: always()
+        run: |
+          find . -path '*/outputs/apk/release/*' -name '*.apk' -printf '%p  %s bytes\n' 2>/dev/null || true
+      - name: Upload unsigned release APK
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: app-release-unsigned-apk
+          path: '**/outputs/apk/release/*.apk'
+          if-no-files-found: error
+
+  # 6/12 — repository guard: never allow signing material into the tree
+  guard:
+    name: "6 · 仓库守卫（无签名材料）"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Fail if any signing material is tracked
+        run: bash .github/scripts/guard-no-signing-material.sh
+
+  # 7/12 — workflow lint
+  workflow-lint:
+    name: "7 · 工作流语法检查"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install actionlint
+        run: bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+      - name: Run actionlint
+        run: ./actionlint -color -shellcheck=
+
+  # 8/12 — repository hygiene
+  repo-hygiene:
+    name: "8 · 仓库卫生检查"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check repo hygiene
+        run: bash .github/scripts/repo-hygiene.sh
+
+  # 9/12 — POSIX shell syntax + shellcheck for privileged scripts
+  shell-scripts:
+    name: "9 · Shell 脚本检查"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Syntax check every shell script
+        run: |
+          set -e
+          fail=0
+          count=0
+          while IFS= read -r -d '' f; do
+            count=$((count + 1))
+            head -n 1 "$f" | grep -q 'bash' && shell=bash || shell=dash
+            if "$shell" -n "$f"; then
+              echo "PASS $shell -n $f"
+            else
+              echo "FAIL $shell -n $f"
+              fail=1
+            fi
+            if grep -q $'\r' "$f"; then
+              echo "FAIL CRLF line endings: $f"
+              fail=1
+            fi
+          done < <(find . -name '*.sh' -not -path './.git/*' -print0)
+          echo "checked $count shell scripts"
+          [ "$count" -gt 0 ] || { echo "::error::expected shell scripts to check"; exit 1; }
+          exit $fail
+      - name: Shellcheck (errors only)
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            if ! shellcheck -S error "$f"; then
+              echo "FAIL shellcheck $f"
+              fail=1
+            fi
+          done < <(find . -name '*.sh' -not -path './.git/*' -print0)
+          exit $fail
+
+  # 10/12 — WebView front-end integrity
+  assets-integrity:
+    name: "10 · 前端资源检查"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Check assets
+        run: node tests/assets_check.js
+
+  # 11/12 — license / notice compliance
+  license-check:
+    name: "11 · 许可证合规检查"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check licenses
+        run: bash tests/license_check.sh
+
+  # 12/12 — secret scan (full git history)
+  secret-scan:
+    name: "12 · 密钥泄露扫描"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSL --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz \
+            | tar xz gitleaks
+      - name: Scan for secrets
+        run: ./gitleaks detect --source . --redact --exit-code 1

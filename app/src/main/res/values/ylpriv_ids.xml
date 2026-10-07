@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自研特权界面用到的控件 ID。
+
+  单独建一个文件（而不是塞进 ids.xml）：ids.xml 是构建期自动汇总生成的大文件，
+  手工往里加条目容易被覆盖。自研界面的 ID 集中放这里，一眼能看出归属。
+-->
+<resources>
+    <!-- 应用列表页 -->
+    <item type="id" name="app_list" />
+    <item type="id" name="app_icon" />
+    <item type="id" name="app_name" />
+    <item type="id" name="app_risk" />
+    <item type="id" name="app_pkg" />
+</resources>
